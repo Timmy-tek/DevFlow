@@ -36,6 +36,10 @@ class ActivityLog extends Model
 
             'file.uploaded' => "uploaded {$p['name']} (v{$p['version']})",
             'file.deleted' => "deleted file {$p['name']}",
+            'cr.opened' => "opened {$ref}{$title}",
+            'cr.revision' => "pushed r{$p['revision']} to {$ref}",
+            'cr.comment' => "commented on {$ref}",
+            'cr.closed' => "closed {$ref}",
             default => $this->action,
         };
     }

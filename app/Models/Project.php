@@ -79,4 +79,9 @@ class Project extends Model
     {
         return $this->hasMany(ProjectFile::class);
     }
+
+    public function changeRequests(): HasMany
+    {
+        return $this->hasMany(ChangeRequest::class);
+    }
 }
