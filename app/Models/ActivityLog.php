@@ -34,7 +34,7 @@ class ActivityLog extends Model
             'task.deleted' => "deleted {$ref}{$title}",
             'comment.added' => "commented on {$ref}",
 
-            'file.uploaded' => "uploaded {$p['name']} (v{$p['version']})",
+            'file.uploaded' => "uploaded {$p['name']} (v{$p['version']})" . (!empty($p['task']) ? " for {$p['task']}" : ''),
             'file.deleted' => "deleted file {$p['name']}",
             'cr.opened' => "opened {$ref}{$title}",
             'cr.revision' => "pushed r{$p['revision']} to {$ref}",

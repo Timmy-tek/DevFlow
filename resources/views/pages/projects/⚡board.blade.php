@@ -18,7 +18,16 @@ use App\Models\Label;
 
 use Illuminate\Support\Facades\Validator;
 
+use App\Models\ChangeRequest;
+use App\Models\FileVersion;
+use App\Models\ProjectFile;
+use App\Services\FileUploadService;
+use Illuminate\Support\Arr;
+use Livewire\WithFileUploads;
+
 new #[Title('Board')] class extends Component {
+
+use WithFileUploads;
     public string $slug;
 
     // Task drawer form
@@ -37,6 +46,7 @@ new #[Title('Board')] class extends Component {
 
     public string $managerLabelName = '';
     public string $managerLabelColor = 'violet';
+    public $taskUploads = [];
 
     public function mount(string $slug): void
     {
@@ -63,7 +73,7 @@ new #[Title('Board')] class extends Component {
     {
         $tasks = $this->project->tasks()
             ->with(['assignee', 'labels'])
-            ->withCount('comments')
+            ->withCount(['comments', 'fileVersions'])
             ->orderBy('position')
             ->orderBy('id')
             ->get()
@@ -122,6 +132,61 @@ new #[Title('Board')] class extends Component {
 
         return $task ? Auth::user()->can('comment', $task) : false;
     }
+
+    #[Computed]
+public function taskFiles()
+{
+    if (! $this->taskId) {
+        return collect();
+    }
+
+    return FileVersion::where('task_id', $this->taskId)
+        ->whereHas('file', fn ($q) => $q->where('project_id', $this->project->id))
+        ->with(['file', 'changeRequest'])
+        ->orderByDesc('id')
+        ->get();
+}
+
+#[Computed]
+public function taskChangeRequests()
+{
+    if (! $this->taskId) {
+        return collect();
+    }
+
+    return ChangeRequest::where('project_id', $this->project->id)
+        ->where('task_id', $this->taskId)
+        ->latest('id')
+        ->get();
+}
+
+public function updatedTaskUploads(): void
+{
+    abort_unless($this->taskId, 422);
+
+    $task = $this->project->tasks()->findOrFail($this->taskId);
+    Gate::authorize('create', [ProjectFile::class, $this->project]);
+
+    $this->resetErrorBag('taskUploads');
+
+    $result = app(FileUploadService::class)->addNewFiles(
+        $this->project,
+        Arr::wrap($this->taskUploads),
+        $task->id,
+        Auth::id(),
+    );
+
+    $this->taskUploads = [];
+    unset($this->taskFiles, $this->columns);
+
+    if ($result['saved'] > 0) {
+        Flux::toast(variant: 'success', text: $result['saved'] === 1 ? 'File attached.' : "{$result['saved']} files attached.");
+    }
+
+    if ($result['problems']) {
+        $this->addError('taskUploads', implode(' ', $result['problems']));
+    }
+}
 
     public function addLabel(): void
     {
@@ -500,6 +565,12 @@ $selectClasses = 'w-full rounded-xl border border-zinc-300/70 bg-white/70 px-3 p
                             </span>
                             @endif
 
+                            @if ($task->file_versions_count)
+    <span class="inline-flex items-center gap-1 text-xs text-ink/60">
+        <flux:icon name="paper-clip" class="size-3.5" />{{ $task->file_versions_count }}
+    </span>
+@endif
+
                             @if ($task->assignee)
                             <flux:avatar :name="$task->assignee->name" :initials="$task->assignee->initials()" size="xs" circle />
                             @endif
@@ -634,6 +705,58 @@ $selectClasses = 'w-full rounded-xl border border-zinc-300/70 bg-white/70 px-3 p
             </div>
             @endif
         </form>
+
+        @if ($taskId)
+    <div class="mt-8 border-t border-zinc-200/70 pt-6 dark:border-white/10">
+        <div class="flex items-center justify-between gap-3">
+            <flux:heading>Files <span class="text-zinc-500 dark:text-zinc-400">({{ $this->taskFiles->count() }})</span></flux:heading>
+
+            @if ($this->canEdit)
+                <flux:button size="sm" icon="arrow-path" :href="route('changes.create', $project->slug).'?task='.$taskId" wire:navigate class="!rounded-full">
+                    Propose a change
+                </flux:button>
+            @endif
+        </div>
+
+        <ul class="mt-4 space-y-2">
+            @forelse ($this->taskFiles as $v)
+                <li wire:key="task-file-{{ $v->id }}" class="flex items-center gap-3 rounded-2xl bg-white/70 px-3 py-2.5 text-sm dark:bg-white/10">
+                    <div class="min-w-0 flex-1">
+                        <p class="truncate font-medium">{{ $v->file->name }}</p>
+                        <p class="truncate text-xs text-zinc-500 dark:text-zinc-400">
+                            v{{ $v->number }} · {{ $v->humanSize() }}@if ($v->changeRequest) · via {{ $v->changeRequest->ref() }}@endif
+                        </p>
+                    </div>
+                    <flux:button size="sm" variant="ghost" icon="arrow-down-tray" :href="route('files.download', $v)" aria-label="Download" />
+                </li>
+            @empty
+                <li class="text-sm text-zinc-500 dark:text-zinc-400">Nothing delivered for this task yet.</li>
+            @endforelse
+        </ul>
+
+        @if ($this->canEdit)
+            <div class="mt-4">
+                <x-dropzone wire:model="taskUploads" compact title="Attach files to this task" hint="New files only · up to 10 MB each" />
+                @error('taskUploads') <p class="mt-2 text-sm text-red-500">{{ $message }}</p> @enderror
+                @error('taskUploads.*') <p class="mt-2 text-sm text-red-500">{{ $message }}</p> @enderror
+            </div>
+        @endif
+
+        @if ($this->taskChangeRequests->isNotEmpty())
+            <div class="mt-4">
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Change requests</p>
+                <div class="mt-2 flex flex-wrap gap-2">
+                    @foreach ($this->taskChangeRequests as $linked)
+                        @php [$linkedLabel, $linkedClass] = $linked->badge(); @endphp
+                        <a href="{{ route('changes.show', [$project->slug, $linked->number]) }}" wire:navigate class="rounded-full px-3 py-1 text-xs {{ $linkedClass }}">
+                            {{ $linked->ref() }} · {{ str($linked->title)->limit(28) }} · {{ $linkedLabel }}
+                        </a>
+                    @endforeach
+                </div>
+            </div>
+        @endif
+    </div>
+@endif
 
         @if ($taskId)
         <div class="mt-8 border-t border-zinc-200/70 pt-6 dark:border-white/10">

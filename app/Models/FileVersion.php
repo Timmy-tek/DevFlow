@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
-#[Fillable(['number', 'original_name', 'path', 'mime', 'size', 'sha256', 'uploaded_by', 'change_request_id', 'note'])]
+#[Fillable(['number', 'original_name', 'path', 'mime', 'size', 'sha256', 'uploaded_by', 'change_request_id', 'note', 'task_id'])]
 class FileVersion extends Model
 {
     public const UPDATED_AT = null;
@@ -40,5 +40,16 @@ class FileVersion extends Model
     public function shortHash(): string
     {
         return substr($this->sha256, 0, 8);
+    }
+
+    public function task(): BelongsTo
+    {
+        // withTrashed: a deleted task still shows its chip on old versions.
+        return $this->belongsTo(Task::class)->withTrashed();
+    }
+
+    public function changeRequest(): BelongsTo
+    {
+        return $this->belongsTo(ChangeRequest::class);
     }
 }

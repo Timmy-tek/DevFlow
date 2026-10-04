@@ -452,7 +452,7 @@ new #[Title('Change request')]
                                         class="mt-2 inline-block text-xs underline">Download</a>
                                 </div>
                             </div>
-                            <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">No inline preview for this file type.</p>
+                            <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">No inline diff available for this file (binary or too large).</p>
                         @endif
                     </div>
                 </x-card>

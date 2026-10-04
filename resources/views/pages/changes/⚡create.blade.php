@@ -12,6 +12,8 @@ use Livewire\Attributes\Computed;
 use Livewire\Attributes\Title;
 use Livewire\Component;
 
+use Livewire\Attributes\Url;
+
 new #[Title('New change request')]
     class extends Component {
     use StagesChangeFiles;
@@ -20,6 +22,7 @@ new #[Title('New change request')]
 
     public string $title = '';
     public string $description = '';
+    #[Url(as: 'task')]
     public string $taskId = '';
     public bool $syncTask = true;
 

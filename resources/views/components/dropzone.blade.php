@@ -1,10 +1,10 @@
-@props(['title' => 'Drop files here or click to browse', 'hint' => ''])
+@props(['title' => 'Drop files here or click to browse', 'hint' => '', 'compact' => false])
 
 <div class="relative" x-data="{ over: false, uploading: false, progress: 0 }"
     x-on:livewire-upload-start="uploading = true; progress = 0"
     x-on:livewire-upload-progress="progress = $event.detail.progress" x-on:livewire-upload-finish="uploading = false"
     x-on:livewire-upload-error="uploading = false">
-    <div class="glass flex flex-col items-center gap-2 rounded-card border-2 border-dashed px-6 py-8 text-center transition"
+    <div class="glass flex flex-col items-center gap-2 rounded-card border-2 border-dashed px-6 {{ $compact ? 'py-4' : 'py-8' }} text-center transition"
         :class="over ? 'border-ink dark:border-brand' : 'border-zinc-300/70 dark:border-white/20'">
         <flux:icon name="arrow-up-tray" class="size-6 text-zinc-500 dark:text-zinc-400" />
         <span class="text-lg font-light">{{ $title }}</span>

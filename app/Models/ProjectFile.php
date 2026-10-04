@@ -40,7 +40,7 @@ class ProjectFile extends Model
      * Stores the upload on the private disk and records it as the next version.
      * The stored name is random, so the user-supplied filename never touches the filesystem.
      */
-    public function addVersion(UploadedFile $upload, ?int $userId, ?string $note = null): FileVersion
+    public function addVersion(UploadedFile $upload, ?int $userId, ?string $note = null, ?int $taskId = null): FileVersion
     {
         $number = ((int) $this->versions()->max('number')) + 1;
 
@@ -62,6 +62,7 @@ class ProjectFile extends Model
             'sha256' => $sha256,
             'uploaded_by' => $userId,
             'note' => $note,
+            'task_id' => $taskId,
         ]);
     }
 }

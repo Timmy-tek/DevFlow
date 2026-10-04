@@ -68,4 +68,14 @@ class Task extends Model
     {
         return $this->hasMany(Comment::class);
     }
+
+    public function fileVersions(): HasMany
+    {
+        return $this->hasMany(FileVersion::class);
+    }
+
+    public function changeRequests(): HasMany
+    {
+        return $this->hasMany(ChangeRequest::class);
+    }
 }
