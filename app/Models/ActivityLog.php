@@ -44,6 +44,8 @@ class ActivityLog extends Model
             'cr.approved' => "approved {$ref}",
             'cr.changes_requested' => "requested changes on {$ref}",
             'cr.merged' => "merged {$ref}{$title}",
+
+            'cr.reopened' => "reopened {$ref}{$title}",
             default => $this->action,
         };
     }

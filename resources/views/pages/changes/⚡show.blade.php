@@ -18,6 +18,8 @@ use Livewire\Attributes\Title;
 use Livewire\Attributes\Url;
 use Livewire\Component;
 
+use App\Models\ActivityLog;
+
 new #[Title('Change request')]
     class extends Component {
     use StagesChangeFiles;
@@ -89,6 +91,36 @@ new #[Title('Change request')]
     public function canMerge(): bool
     {
         return Auth::user()->can('merge', $this->cr);
+    }
+
+    #[Computed]
+    public function threads()
+    {
+        return $this->cr->threads()->with(['comments.author', 'author', 'resolver'])->orderBy('id')->get();
+    }
+
+    #[Computed]
+    public function openThreadCount(): int
+    {
+        return $this->threads->whereNull('resolved_at')->count();
+    }
+
+    #[Computed]
+    public function canDiscuss(): bool
+    {
+        return Auth::user()->can('discuss', $this->cr);
+    }
+
+    #[Computed]
+    public function canResolve(): bool
+    {
+        return Auth::user()->can('resolve', $this->cr);
+    }
+
+    #[Computed]
+    public function canReopen(): bool
+    {
+        return Auth::user()->can('reopen', $this->cr);
     }
 
     #[Computed]
@@ -177,6 +209,14 @@ new #[Title('Change request')]
                 }
             }
 
+            $fileThreads = $this->threads->where('project_file_id', $rf->project_file_id);
+            $current = $fileThreads->where('cr_revision_file_id', $rf->id);
+
+            $entry['lineThreads'] = $current->where('kind', 'line')->groupBy(fn($thread) => $thread->side . ':' . $thread->line);
+            $entry['pins'] = $current->where('kind', 'pin')->values();
+            $entry['outdated'] = $fileThreads->where('cr_revision_file_id', '!=', $rf->id)->values();
+            $entry['openThreads'] = $fileThreads->whereNull('resolved_at')->count();
+
             $out[] = $entry;
         }
 
@@ -206,8 +246,14 @@ new #[Title('Change request')]
             $items[] = ['type' => 'merged', 'at' => $cr->merged_at, 'user' => $cr->merger];
         }
 
-        if ($cr->closed_at) {
-            $items[] = ['type' => 'closed', 'at' => $cr->closed_at, 'user' => null];
+        $history = ActivityLog::where('project_id', $cr->project_id)
+            ->whereIn('action', ['cr.closed', 'cr.reopened'])
+            ->where('properties->ref', $cr->ref())
+            ->with('actor')
+            ->get();
+
+        foreach ($history as $log) {
+            $items[] = ['type' => $log->action === 'cr.closed' ? 'closed' : 'reopened', 'at' => $log->created_at, 'user' => $log->actor];
         }
 
         usort($items, fn($a, $b) => $a['at'] <=> $b['at']);
@@ -227,6 +273,8 @@ new #[Title('Change request')]
             $this->eligibleReviewers,
             $this->viewedFileIds,
             $this->mergedVersions,
+            $this->threads,
+            $this->openThreadCount,
         );
     }
 
@@ -377,6 +425,118 @@ new #[Title('Change request')]
 
         $this->forgetCaches();
         Flux::toast(variant: 'success', text: 'Merged. The new file versions are live.');
+    }
+
+    protected function cleanBody(string $body): ?string
+    {
+        $body = trim($body);
+
+        return $body === '' ? null : mb_substr($body, 0, 2000);
+    }
+
+    public function startLineThread(int $fileId, string $side, int $line, string $body): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('discuss', $cr);
+
+        abort_unless(in_array($side, ['old', 'new'], true) && $line > 0, 422);
+
+        $body = $this->cleanBody($body);
+        $rf = $cr->latestFiles()->get($fileId);
+        abort_unless($rf, 404);
+
+        if ($body === null) {
+            return;
+        }
+
+        // Anchored to the exact proposed file it was written on, so later revisions can mark it outdated.
+        $thread = $cr->threads()->create([
+            'project_file_id' => $fileId,
+            'cr_revision_file_id' => $rf->id,
+            'kind' => 'line',
+            'side' => $side,
+            'line' => $line,
+            'created_by' => Auth::id(),
+        ]);
+
+        $thread->comments()->create(['user_id' => Auth::id(), 'body' => $body]);
+
+        app(ChangeRequestService::class)->log($cr, 'cr.comment', Auth::id());
+
+        $this->forgetCaches();
+    }
+
+    public function startPinThread(int $fileId, float $x, float $y, string $body): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('discuss', $cr);
+
+        $body = $this->cleanBody($body);
+        $rf = $cr->latestFiles()->get($fileId);
+        abort_unless($rf && $rf->isImage(), 404);
+
+        if ($body === null) {
+            return;
+        }
+
+        $thread = $cr->threads()->create([
+            'project_file_id' => $fileId,
+            'cr_revision_file_id' => $rf->id,
+            'kind' => 'pin',
+            'pin_x' => max(0, min(100, round($x, 2))),
+            'pin_y' => max(0, min(100, round($y, 2))),
+            'created_by' => Auth::id(),
+        ]);
+
+        $thread->comments()->create(['user_id' => Auth::id(), 'body' => $body]);
+
+        app(ChangeRequestService::class)->log($cr, 'cr.comment', Auth::id());
+
+        $this->forgetCaches();
+    }
+
+    public function replyThread(int $threadId, string $body): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('discuss', $cr);
+
+        $thread = $cr->threads()->findOrFail($threadId);
+        $body = $this->cleanBody($body);
+
+        if ($body === null) {
+            return;
+        }
+
+        $thread->comments()->create(['user_id' => Auth::id(), 'body' => $body]);
+
+        $this->forgetCaches();
+    }
+
+    public function toggleResolved(int $threadId): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('resolve', $cr);
+
+        $thread = $cr->threads()->findOrFail($threadId);
+        $resolved = $thread->isResolved();
+
+        $thread->update([
+            'resolved_at' => $resolved ? null : now(),
+            'resolved_by' => $resolved ? null : Auth::id(),
+        ]);
+
+        $this->forgetCaches();
+    }
+
+    public function reopen(): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('reopen', $cr);
+
+        app(ChangeRequestService::class)->reopen($cr, Auth::id());
+
+        $this->forgetCaches();
+        Flux::toast(variant: 'success', text: 'Change request reopened.');
     }
 
     public function close(): void
@@ -545,7 +705,8 @@ new #[Title('Change request')]
                                     </p>
                                     @if ($review->body)
                                         <p class="mt-1 whitespace-pre-line rounded-2xl bg-white/70 px-4 py-3 text-sm dark:bg-white/10">
-                                            {{ $review->body }}</p>
+                                            {{ $review->body }}
+                                        </p>
                                     @endif
                                 @elseif ($item['type'] === 'comment')
                                     <div class="flex gap-3">
@@ -560,7 +721,11 @@ new #[Title('Change request')]
                                     <p class="text-sm"><span class="font-medium">{{ $item['user']?->name ?? 'Someone' }}</span>
                                         merged this change request</p>
                                 @elseif ($item['type'] === 'closed')
-                                    <p class="text-sm">This change request was closed without merging</p>
+                                    <p class="text-sm"><span class="font-medium">{{ $item['user']?->name ?? 'Someone' }}</span>
+                                        closed this change request without merging</p>
+                                @elseif ($item['type'] === 'reopened')
+                                    <p class="text-sm"><span class="font-medium">{{ $item['user']?->name ?? 'Someone' }}</span>
+                                        reopened this change request</p>
                                 @endif
 
                                 <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{{ $item['at']->diffForHumans() }}</p>
@@ -658,6 +823,11 @@ new #[Title('Change request')]
                                 <flux:icon name="eye" class="size-4" />
                                 {{ count($this->viewedFileIds) }} of {{ $this->fileCount }} files viewed by you
                             </div>
+
+                            <div class="flex items-center gap-2 text-white/60">
+                                <flux:icon name="chat-bubble-left-right" class="size-4" />
+                                {{ $this->openThreadCount }} open {{ $this->openThreadCount === 1 ? 'thread' : 'threads' }}
+                            </div>
                         </div>
 
                         @if ($this->canMerge)
@@ -698,10 +868,15 @@ new #[Title('Change request')]
                             class="rounded-full bg-brand px-4 py-2.5 text-center text-sm font-medium text-ink">View in Files</a>
                     </x-card>
                 @else
-                    <x-card tone="dark" class="flex flex-col gap-2">
+                    <x-card tone="dark" class="flex flex-col gap-3">
                         <h2 class="text-lg font-medium">Closed</h2>
                         <p class="text-sm text-white/60">This change request was closed without merging. Nothing in the project
                             changed.</p>
+
+                        @if ($this->canReopen)
+                            <button type="button" wire:click="reopen"
+                                class="rounded-full bg-brand px-4 py-2.5 text-sm font-medium text-ink">Reopen</button>
+                        @endif
                     </x-card>
                 @endif
 
@@ -726,102 +901,13 @@ new #[Title('Change request')]
     @if ($tab === 'files')
         <div class="flex flex-col gap-4">
             <p class="px-2 text-sm text-zinc-500 dark:text-zinc-400">
-                {{ count($this->viewedFileIds) }} of {{ $this->fileCount }} files viewed
+                {{ count($this->viewedFileIds) }} of {{ $this->fileCount }} files viewed · {{ $this->openThreadCount }} open
+                {{ $this->openThreadCount === 1 ? 'thread' : 'threads' }}
             </p>
 
             @forelse ($this->diffs as $d)
-                @php
-                    $rf = $d['rf'];
-                    $base = $d['base'];
-                    $isViewed = in_array($rf->project_file_id, $this->viewedFileIds, true);
-                @endphp
-
-                <x-card x-data="{ viewed: {{ $isViewed ? 'true' : 'false' }} }" wire:key="diff-{{ $rf->id }}">
-                    <div class="flex flex-wrap items-center justify-between gap-3">
-                        <div class="min-w-0">
-                            <p class="truncate font-medium">{{ $rf->file?->name ?? $rf->original_name }}</p>
-                            <p class="text-xs text-zinc-500 dark:text-zinc-400">v{{ $base->number }} → proposed in
-                                r{{ $rf->revision->number }}</p>
-                        </div>
-
-                        <div class="flex items-center gap-4 text-xs">
-                            @if ($d['kind'] === 'text')
-                                <span class="text-emerald-600 dark:text-emerald-400">+{{ $d['added'] }}</span>
-                                <span class="text-rose-600 dark:text-rose-400">−{{ $d['removed'] }}</span>
-                            @endif
-                            <label class="flex cursor-pointer items-center gap-1.5 text-zinc-600 dark:text-zinc-300">
-                                <input type="checkbox" x-model="viewed"
-                                    x-on:change="$wire.toggleViewed({{ $rf->project_file_id }})"> Viewed
-                            </label>
-                        </div>
-                    </div>
-
-                    <div x-show="! viewed" class="mt-4">
-                        @if ($d['kind'] === 'text')
-                            <div
-                                class="overflow-x-auto rounded-xl border border-zinc-200/70 font-mono text-xs dark:border-white/10">
-                                @forelse ($d['rows'] as $row)
-                                    @if ($row['type'] === 'gap')
-                                        <div class="bg-zinc-900/5 px-3 py-1 text-center text-zinc-500 dark:bg-white/5 dark:text-zinc-400">
-                                            {{ $row['text'] }}</div>
-                                    @else
-                                        <div @class([
-                                            'grid grid-cols-[3rem_3rem_1.25rem_1fr]',
-                                            'bg-emerald-100/70 text-emerald-900 dark:bg-emerald-500/15 dark:text-emerald-200' => $row['type'] === 'add',
-                                            'bg-rose-100/80 text-rose-900 dark:bg-rose-500/15 dark:text-rose-200' => $row['type'] === 'del',
-                                        ])>
-                                            <span class="select-none px-2 text-end opacity-50">{{ $row['old'] }}</span>
-                                            <span class="select-none px-2 text-end opacity-50">{{ $row['new'] }}</span>
-                                            <span
-                                                class="select-none">{{ $row['type'] === 'add' ? '+' : ($row['type'] === 'del' ? '−' : ' ') }}</span>
-                                            <span class="whitespace-pre-wrap break-all pe-3">{{ $row['text'] }}</span>
-                                        </div>
-                                    @endif
-                                @empty
-                                    <div class="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">No textual changes (whitespace
-                                        or line endings only).</div>
-                                @endforelse
-                            </div>
-                        @elseif ($d['kind'] === 'image')
-                            <div x-data="{ pos: 50 }" class="space-y-2">
-                                <div class="relative h-80 overflow-hidden rounded-xl bg-zinc-900/5 dark:bg-white/5">
-                                    <img src="{{ route('cr-files.preview', $rf) }}" alt="Proposed version"
-                                        class="absolute inset-0 size-full object-contain">
-                                    <img src="{{ route('files.preview', $base) }}" alt="Current version"
-                                        class="absolute inset-0 size-full object-contain"
-                                        :style="`clip-path: inset(0 ${100 - pos}% 0 0)`">
-                                    <div class="pointer-events-none absolute inset-y-0 w-0.5 bg-brand shadow"
-                                        :style="`left: ${pos}%`"></div>
-                                </div>
-                                <input type="range" min="0" max="100" x-model="pos" class="w-full accent-ink dark:accent-brand"
-                                    aria-label="Compare current and proposed">
-                                <div class="flex justify-between text-xs text-zinc-500 dark:text-zinc-400">
-                                    <span>Current · v{{ $base->number }}</span>
-                                    <span>Proposed · r{{ $rf->revision->number }}</span>
-                                </div>
-                            </div>
-                        @else
-                            <div class="grid gap-3 text-sm sm:grid-cols-2">
-                                <div class="rounded-xl bg-zinc-900/5 p-3 dark:bg-white/5">
-                                    <p class="font-medium">Current · v{{ $base->number }}</p>
-                                    <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{{ $base->humanSize() }} ·
-                                        {{ $base->shortHash() }}</p>
-                                    <a href="{{ route('files.download', $base) }}"
-                                        class="mt-2 inline-block text-xs underline">Download</a>
-                                </div>
-                                <div class="rounded-xl bg-zinc-900/5 p-3 dark:bg-white/5">
-                                    <p class="font-medium">Proposed · r{{ $rf->revision->number }}</p>
-                                    <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{{ $rf->humanSize() }} ·
-                                        {{ $rf->shortHash() }}</p>
-                                    <a href="{{ route('cr-files.download', $rf) }}"
-                                        class="mt-2 inline-block text-xs underline">Download</a>
-                                </div>
-                            </div>
-                            <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">No inline diff available for this file (binary
-                                or too large).</p>
-                        @endif
-                    </div>
-                </x-card>
+                <x-file-diff :d="$d" :viewed="in_array($d['rf']->project_file_id, $this->viewedFileIds, true)"
+                    :can-discuss="$this->canDiscuss" :can-resolve="$this->canResolve" />
             @empty
                 <x-card class="py-12 text-center text-sm text-zinc-500 dark:text-zinc-400">No files in this change
                     request.</x-card>
@@ -864,7 +950,8 @@ new #[Title('Change request')]
                         <div>
                             <p class="font-medium">r{{ $rev->number }}</p>
                             <p class="text-xs text-zinc-500 dark:text-zinc-400">{{ $rev->author?->name ?? 'Someone' }} ·
-                                {{ $rev->created_at->format('M j, Y · g:i A') }}</p>
+                                {{ $rev->created_at->format('M j, Y · g:i A') }}
+                            </p>
                         </div>
                     </div>
 

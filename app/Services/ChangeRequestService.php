@@ -65,13 +65,30 @@ class ChangeRequestService
             $current = $file->latestVersion;
 
             if ($current && hash_file('sha256', $upload->getRealPath()) === $current->sha256) {
-                $problems[] = "{$name} is identical to the current version of {$file->name}.";
+                $number = $current->change_request_id
+                    ? ChangeRequest::whereKey($current->change_request_id)->value('number')
+                    : null;
+                $source = $number ? ", merged from CR-{$number}" : '';
+
+                $problems[] = "{$name} is identical to the current version of {$file->name} (v{$current->number}{$source}), so there's nothing to change. Upload your edited copy instead.";
             }
         }
 
         return $problems;
     }
 
+    public function reopen(ChangeRequest $cr, ?int $userId): void
+    {
+        $cr->update(['status' => ChangeRequest::OPEN, 'closed_at' => null]);
+
+        $task = $cr->task;
+
+        if ($task && $cr->sync_task && in_array($task->status, [TaskStatus::Todo, TaskStatus::InProgress], true)) {
+            $this->moveTask($task, TaskStatus::Review);
+        }
+
+        $this->log($cr, 'cr.reopened', $userId);
+    }
     /** Stores the files and records a new revision. Call problems() first. */
     public function pushRevision(ChangeRequest $cr, array $staged, ?int $userId, ?string $note = null): CrRevision
     {

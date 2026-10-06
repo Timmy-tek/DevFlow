@@ -188,6 +188,11 @@ class ChangeRequest extends Model
         );
     }
 
+    public function threads(): HasMany
+    {
+        return $this->hasMany(CrThread::class);
+    }
+
     /** @return array<int, array{id: int, user_id: int, state: string, cr_revision_id: int}> */
     protected function reviewRows(iterable $reviews): array
     {
