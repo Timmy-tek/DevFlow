@@ -2,9 +2,11 @@
 
 namespace App\Models;
 
+use App\Support\ReviewSummary;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Support\Collection;
@@ -43,14 +45,42 @@ class ChangeRequest extends Model
         return $this->status === self::OPEN;
     }
 
-    /** @return array{0: string, 1: string} label and Tailwind classes */
+    /**
+     * Label and Tailwind classes. For open requests this reflects the review state,
+     * as long as the `reviews` and `latestRevision` relations were eager loaded.
+     *
+     * @return array{0: string, 1: string}
+     */
     public function badge(): array
     {
         return match ($this->status) {
             self::MERGED => ['Merged', 'bg-lavender text-ink'],
             self::CLOSED => ['Closed', 'bg-zinc-200 text-ink dark:bg-white/15 dark:text-white'],
-            default => ['Open', 'bg-butter text-ink'],
+            default => $this->openBadge(),
         };
+    }
+
+    protected function openBadge(): array
+    {
+        if (!$this->relationLoaded('reviews')) {
+            return ['Open', 'bg-butter text-ink'];
+        }
+
+        $verdicts = ReviewSummary::verdicts(
+            $this->reviewRows($this->reviews),
+            (int) $this->created_by,
+            $this->latestRevision?->id,
+        );
+
+        if (in_array('changes_requested', $verdicts, true)) {
+            return ['Changes requested', 'bg-peach text-ink'];
+        }
+
+        if (in_array('approved', $verdicts, true)) {
+            return ['Approved', 'bg-mint text-ink'];
+        }
+
+        return ['In review', 'bg-butter text-ink'];
     }
 
     public function project(): BelongsTo
@@ -68,6 +98,11 @@ class ChangeRequest extends Model
         return $this->belongsTo(User::class, 'created_by');
     }
 
+    public function merger(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'merged_by');
+    }
+
     public function revisions(): HasMany
     {
         return $this->hasMany(CrRevision::class);
@@ -76,6 +111,16 @@ class ChangeRequest extends Model
     public function comments(): HasMany
     {
         return $this->hasMany(CrComment::class);
+    }
+
+    public function reviews(): HasMany
+    {
+        return $this->hasMany(CrReview::class);
+    }
+
+    public function reviewers(): BelongsToMany
+    {
+        return $this->belongsToMany(User::class, 'cr_reviewers')->withTimestamps();
     }
 
     public function latestRevision(): HasOne
@@ -95,5 +140,68 @@ class ChangeRequest extends Model
             ->orderBy('cr_revision_id')
             ->get()
             ->keyBy('project_file_id');
+    }
+
+    /** Reviews, approvals, stale approvals and merge blockers, all in one object. */
+    public function reviewSummary(): ReviewSummary
+    {
+        $latestRevisionId = $this->revisions()->max('id');
+        $latestRevisionId = $latestRevisionId === null ? null : (int) $latestRevisionId;
+
+        $reviews = $this->reviewRows($this->reviews()->orderBy('id')->get());
+        $requestedIds = $this->reviewers()->pluck('users.id')->map(fn($id) => (int) $id)->all();
+
+        $userIds = array_values(array_unique([...$requestedIds, ...array_column($reviews, 'user_id')]));
+        $names = User::whereIn('id', $userIds)->pluck('name', 'id')->all();
+
+        // A file is "out of date" when someone merged a newer version after this was proposed.
+        $files = $this->latestFiles();
+        $current = FileVersion::whereIn('project_file_id', $files->keys())
+            ->selectRaw('project_file_id, max(number) as latest')
+            ->groupBy('project_file_id')
+            ->pluck('latest', 'project_file_id');
+
+        $outOfDate = [];
+
+        foreach ($files as $fileId => $rf) {
+            $deleted = $rf->file?->trashed() ?? true;
+            $now = (int) ($current[$fileId] ?? 0);
+
+            if ($deleted || $now !== $rf->baseVersion->number) {
+                $outOfDate[] = [
+                    'name' => $rf->file?->name ?? $rf->original_name,
+                    'base' => $rf->baseVersion->number,
+                    'current' => $deleted ? null : $now,
+                ];
+            }
+        }
+
+        return ReviewSummary::build(
+            $reviews,
+            $requestedIds,
+            $names,
+            (int) $this->created_by,
+            $latestRevisionId,
+            $outOfDate,
+            $files->isNotEmpty(),
+            $this->isOpen(),
+        );
+    }
+
+    /** @return array<int, array{id: int, user_id: int, state: string, cr_revision_id: int}> */
+    protected function reviewRows(iterable $reviews): array
+    {
+        $rows = [];
+
+        foreach ($reviews as $review) {
+            $rows[] = [
+                'id' => (int) $review->id,
+                'user_id' => (int) $review->user_id,
+                'state' => $review->state,
+                'cr_revision_id' => (int) $review->cr_revision_id,
+            ];
+        }
+
+        return $rows;
     }
 }

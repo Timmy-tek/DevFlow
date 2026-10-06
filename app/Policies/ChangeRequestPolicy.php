@@ -18,7 +18,7 @@ class ChangeRequestPolicy
         return $user->roleIn($project->workspace)?->canContribute() ?? false;
     }
 
-    // Push revisions or close: the author, or a workspace manager, while it's open.
+    // Push revisions, manage reviewers or close: the author, or a workspace manager, while it's open.
     public function revise(User $user, ChangeRequest $cr): bool
     {
         if (!$cr->isOpen()) {
@@ -30,6 +30,20 @@ class ChangeRequestPolicy
     }
 
     public function close(User $user, ChangeRequest $cr): bool
+    {
+        return $this->revise($user, $cr);
+    }
+
+    // Approve or request changes: contributors, but never on your own change request.
+    public function review(User $user, ChangeRequest $cr): bool
+    {
+        return $cr->isOpen()
+            && $user->id !== $cr->created_by
+            && ($user->roleIn($cr->project->workspace)?->canContribute() ?? false);
+    }
+
+    // Whether the Merge button appears. The service still checks the rules under a lock.
+    public function merge(User $user, ChangeRequest $cr): bool
     {
         return $this->revise($user, $cr);
     }

@@ -21,6 +21,15 @@
             ->latest('id')
             ->limit(8)
             ->get();
+
+        $waiting = \App\Models\ChangeRequest::query()
+            ->whereHas('project', fn($q) => $q->where('workspace_id', $workspace->id))
+            ->where('status', 'open')
+            ->whereHas('reviewers', fn($q) => $q->where('users.id', auth()->id()))
+            ->whereDoesntHave('reviews', fn($q) => $q->where('user_id', auth()->id()))
+            ->with('project')
+            ->latest('id')
+            ->get();
     @endphp
 
     <div class="mx-auto flex w-full max-w-7xl flex-col gap-6">
@@ -83,17 +92,24 @@
                 </div>
             </x-card>
 
-            {{-- Review queue (dark contrast card) --}}
+            {{-- Review queue --}}
             <x-card tone="dark" class="flex flex-col justify-between lg:col-span-3">
                 <h2 class="text-lg font-medium">Review queue</h2>
                 <div class="my-6">
-                    <div class="text-7xl font-light leading-none">5</div>
-                    <p class="mt-2 text-sm text-white/60">change requests waiting for you</p>
+                    <div class="text-7xl font-light leading-none">{{ $waiting->count() }}</div>
+                    <p class="mt-2 text-sm text-white/60">
+                        {{ $waiting->count() === 1 ? 'change request is' : 'change requests are' }} waiting for you</p>
                 </div>
-                <a href="#"
-                    class="inline-flex items-center justify-center rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-ink">
-                    Open queue
-                </a>
+                @if ($waiting->isNotEmpty())
+                    <a href="{{ route('changes.show', [$waiting->first()->project->slug, $waiting->first()->number]) }}"
+                        wire:navigate
+                        class="inline-flex items-center justify-center rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-ink">Open
+                        next</a>
+                @else
+                    <span
+                        class="inline-flex items-center justify-center rounded-full border border-white/15 px-5 py-2.5 text-sm text-white/60">All
+                        caught up</span>
+                @endif
             </x-card>
 
             {{-- Pastel project cards --}}

@@ -56,7 +56,7 @@ new #[Title('Change requests')]
 
         return $this->project->changeRequests()
             ->where('status', $filter)
-            ->with(['author', 'task'])
+            ->with(['author', 'task', 'reviews', 'latestRevision'])
             ->withCount('revisions')
             ->latest('id')
             ->get();

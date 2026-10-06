@@ -11,6 +11,11 @@ use App\Models\Task;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
+use App\Models\ProjectFile;
+use Illuminate\Support\Facades\Storage;
+use RuntimeException;
+use Throwable;
+
 class ChangeRequestService
 {
     public const MAX_BYTES = 10 * 1024 * 1024;
@@ -158,5 +163,83 @@ class ChangeRequestService
         $ext = strtolower(preg_replace('/[^A-Za-z0-9]/', '', pathinfo($name, PATHINFO_EXTENSION)));
 
         return substr($ext, 0, 10);
+    }
+
+    /**
+     * Merges the proposed files into the project as new versions.
+     * Everything is re-checked under a row lock, so two people can't merge at once
+     * and nobody can merge something that went out of date a moment ago.
+     *
+     * @throws RuntimeException when the change request isn't ready to merge
+     */
+    public function merge(ChangeRequest $cr, int $userId): void
+    {
+        $copied = [];
+
+        try {
+            DB::transaction(function () use ($cr, $userId, &$copied) {
+                $locked = ChangeRequest::whereKey($cr->id)->lockForUpdate()->firstOrFail();
+
+                $summary = $locked->reviewSummary();
+
+                if (!$summary->ready()) {
+                    throw new RuntimeException(
+                        $summary->blockers() === []
+                        ? 'This change request can no longer be merged.'
+                        : 'Not ready to merge: ' . implode('; ', $summary->blockers()) . '.'
+                    );
+                }
+
+                foreach ($locked->latestFiles() as $rf) {
+                    $file = ProjectFile::lockForUpdate()->findOrFail($rf->project_file_id);
+                    $current = (int) $file->versions()->max('number');
+
+                    if ($current !== $rf->baseVersion->number) {
+                        throw new RuntimeException("{$file->name} changed while merging. Push a new revision based on the latest version.");
+                    }
+
+                    $ext = $this->extensionOf($rf->original_name);
+                    $target = "projects/{$locked->project_id}/files/{$file->id}/v" . ($current + 1) . '-' . Str::random(12) . ($ext !== '' ? '.' . $ext : '');
+
+                    Storage::disk('local')->copy($rf->path, $target);
+                    $copied[] = $target;
+
+                    // The version keeps the author's attribution and inherits the task.
+                    $file->versions()->create([
+                        'number' => $current + 1,
+                        'original_name' => $rf->original_name,
+                        'path' => $target,
+                        'mime' => $rf->mime,
+                        'size' => $rf->size,
+                        'sha256' => $rf->sha256,
+                        'uploaded_by' => $rf->revision->created_by,
+                        'task_id' => $locked->task_id,
+                        'change_request_id' => $locked->id,
+                        'note' => 'Merged from ' . $locked->ref() . ': ' . $locked->title,
+                    ]);
+                }
+
+                $locked->update([
+                    'status' => ChangeRequest::MERGED,
+                    'merged_by' => $userId,
+                    'merged_at' => now(),
+                ]);
+
+                $task = $locked->task;
+
+                if ($task && $locked->sync_task && $task->status !== TaskStatus::Done) {
+                    $this->moveTask($task, TaskStatus::Done);
+                }
+
+                $this->log($locked, 'cr.merged', $userId);
+            });
+        } catch (Throwable $e) {
+            // The database rolled back, so remove any files we already copied.
+            foreach ($copied as $path) {
+                Storage::disk('local')->delete($path);
+            }
+
+            throw $e;
+        }
     }
 }

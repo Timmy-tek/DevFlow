@@ -40,6 +40,10 @@ class ActivityLog extends Model
             'cr.revision' => "pushed r{$p['revision']} to {$ref}",
             'cr.comment' => "commented on {$ref}",
             'cr.closed' => "closed {$ref}",
+
+            'cr.approved' => "approved {$ref}",
+            'cr.changes_requested' => "requested changes on {$ref}",
+            'cr.merged' => "merged {$ref}{$title}",
             default => $this->action,
         };
     }

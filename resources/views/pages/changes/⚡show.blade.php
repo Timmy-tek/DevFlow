@@ -1,10 +1,13 @@
 <?php
 
+use App\Enums\WorkspaceRole;
 use App\Livewire\Concerns\StagesChangeFiles;
 use App\Models\ChangeRequest;
-use App\Models\CrComment;
+use App\Models\CrFileView;
+use App\Models\FileVersion;
 use App\Models\Project;
 use App\Services\ChangeRequestService;
+use App\Support\ReviewSummary;
 use App\Support\TextDiff;
 use Flux\Flux;
 use Illuminate\Support\Facades\Auth;
@@ -27,6 +30,7 @@ new #[Title('Change request')]
 
     public string $commentBody = '';
     public string $revisionNote = '';
+    public string $reviewBody = '';
 
     public function mount(string $slug, int $number): void
     {
@@ -53,8 +57,14 @@ new #[Title('Change request')]
     {
         return $this->project->changeRequests()
             ->where('number', $this->number)
-            ->with(['author', 'task'])
+            ->with(['author', 'merger', 'task', 'reviews', 'latestRevision'])
             ->firstOrFail();
+    }
+
+    #[Computed]
+    public function summary(): ReviewSummary
+    {
+        return $this->cr->reviewSummary();
     }
 
     #[Computed]
@@ -67,6 +77,18 @@ new #[Title('Change request')]
     public function canComment(): bool
     {
         return Auth::user()->can('comment', $this->cr);
+    }
+
+    #[Computed]
+    public function canReview(): bool
+    {
+        return Auth::user()->can('review', $this->cr);
+    }
+
+    #[Computed]
+    public function canMerge(): bool
+    {
+        return Auth::user()->can('merge', $this->cr);
     }
 
     #[Computed]
@@ -85,6 +107,44 @@ new #[Title('Change request')]
     public function projectFiles()
     {
         return $this->project->files()->orderBy('name')->get();
+    }
+
+    // Workspace members who can review, minus the author and anyone already asked.
+    #[Computed]
+    public function eligibleReviewers()
+    {
+        $cr = $this->cr;
+        $taken = $cr->reviewers()->pluck('users.id')->map(fn($id) => (int) $id)->all();
+
+        return $this->project->workspace->members()->orderBy('name')->get()
+            ->filter(fn($member) => $member->id !== $cr->created_by
+                && !in_array($member->id, $taken, true)
+                && WorkspaceRole::from($member->pivot->role)->canContribute())
+            ->values();
+    }
+
+    // A "Viewed" tick only counts while the file is unchanged since you ticked it.
+    #[Computed]
+    public function viewedFileIds(): array
+    {
+        $latest = $this->cr->latestFiles();
+
+        return CrFileView::where('change_request_id', $this->cr->id)
+            ->where('user_id', Auth::id())
+            ->get()
+            ->filter(fn($view) => $latest->get($view->project_file_id)?->id === $view->cr_revision_file_id)
+            ->pluck('project_file_id')
+            ->all();
+    }
+
+    #[Computed]
+    public function mergedVersions()
+    {
+        if ($this->cr->status !== ChangeRequest::MERGED) {
+            return collect();
+        }
+
+        return FileVersion::where('change_request_id', $this->cr->id)->with('file')->orderBy('id')->get();
     }
 
     // Each changed file compared against the version it was based on.
@@ -123,7 +183,7 @@ new #[Title('Change request')]
         return $out;
     }
 
-    // One chronological stream. Reviews and merge events join it in the next build.
+    // One chronological stream of everything that happened.
     #[Computed]
     public function timeline(): array
     {
@@ -138,6 +198,14 @@ new #[Title('Change request')]
             $items[] = ['type' => 'comment', 'at' => $comment->created_at, 'user' => $comment->author, 'comment' => $comment];
         }
 
+        foreach ($cr->reviews()->with(['reviewer', 'revision'])->get() as $review) {
+            $items[] = ['type' => 'review', 'at' => $review->created_at, 'user' => $review->reviewer, 'review' => $review];
+        }
+
+        if ($cr->merged_at) {
+            $items[] = ['type' => 'merged', 'at' => $cr->merged_at, 'user' => $cr->merger];
+        }
+
         if ($cr->closed_at) {
             $items[] = ['type' => 'closed', 'at' => $cr->closed_at, 'user' => null];
         }
@@ -145,6 +213,21 @@ new #[Title('Change request')]
         usort($items, fn($a, $b) => $a['at'] <=> $b['at']);
 
         return $items;
+    }
+
+    protected function forgetCaches(): void
+    {
+        unset(
+            $this->cr,
+            $this->summary,
+            $this->revisions,
+            $this->fileCount,
+            $this->diffs,
+            $this->timeline,
+            $this->eligibleReviewers,
+            $this->viewedFileIds,
+            $this->mergedVersions,
+        );
     }
 
     public function addComment(): void
@@ -189,8 +272,111 @@ new #[Title('Change request')]
         $this->staged = [];
         $this->revisionNote = '';
 
-        unset($this->cr, $this->revisions, $this->fileCount, $this->diffs, $this->timeline);
-        Flux::toast(variant: 'success', text: 'Revision pushed.');
+        $this->forgetCaches();
+        Flux::toast(variant: 'success', text: 'Revision pushed. Earlier approvals are now stale.');
+    }
+
+    public function submitReview(string $state): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('review', $cr);
+
+        abort_unless(in_array($state, ['approved', 'changes_requested'], true), 422);
+
+        $this->validate([
+            'reviewBody' => $state === 'changes_requested'
+                ? ['required', 'string', 'min:3', 'max:2000']
+                : ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $revision = $cr->latestRevision;
+        abort_unless($revision, 422);
+
+        // The review is pinned to the revision it was written against.
+        $cr->reviews()->create([
+            'user_id' => Auth::id(),
+            'cr_revision_id' => $revision->id,
+            'state' => $state,
+            'body' => trim($this->reviewBody) ?: null,
+        ]);
+
+        app(ChangeRequestService::class)->log($cr, $state === 'approved' ? 'cr.approved' : 'cr.changes_requested', Auth::id());
+
+        $this->reset('reviewBody');
+        $this->forgetCaches();
+        Flux::toast(variant: 'success', text: $state === 'approved' ? 'Approved.' : 'Changes requested.');
+    }
+
+    public function addReviewer(string $userId): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('revise', $cr);
+
+        if ($userId === '') {
+            return;
+        }
+
+        $user = $this->eligibleReviewers->firstWhere('id', (int) $userId);
+        abort_unless($user, 422);
+
+        $cr->reviewers()->syncWithoutDetaching([$user->id]);
+
+        $this->forgetCaches();
+    }
+
+    public function removeReviewer(int $userId): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('revise', $cr);
+
+        $cr->reviewers()->detach($userId);
+
+        $this->forgetCaches();
+    }
+
+    public function toggleViewed(int $fileId): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('view', $cr);
+
+        $rf = $cr->latestFiles()->get($fileId);
+        abort_unless($rf, 404);
+
+        $existing = CrFileView::where('change_request_id', $cr->id)
+            ->where('user_id', Auth::id())
+            ->where('project_file_id', $fileId)
+            ->first();
+
+        if ($existing && $existing->cr_revision_file_id === $rf->id) {
+            $existing->delete();
+        } else {
+            CrFileView::updateOrCreate(
+                ['change_request_id' => $cr->id, 'user_id' => Auth::id(), 'project_file_id' => $fileId],
+                ['cr_revision_file_id' => $rf->id],
+            );
+        }
+
+        unset($this->viewedFileIds);
+    }
+
+    public function merge(): void
+    {
+        $cr = $this->cr;
+        Gate::authorize('merge', $cr);
+
+        $this->resetErrorBag('merge');
+
+        try {
+            app(ChangeRequestService::class)->merge($cr, Auth::id());
+        } catch (\RuntimeException $e) {
+            $this->addError('merge', $e->getMessage());
+            $this->forgetCaches();
+
+            return;
+        }
+
+        $this->forgetCaches();
+        Flux::toast(variant: 'success', text: 'Merged. The new file versions are live.');
     }
 
     public function close(): void
@@ -200,7 +386,7 @@ new #[Title('Change request')]
 
         app(ChangeRequestService::class)->close($cr, Auth::id());
 
-        unset($this->cr, $this->timeline);
+        $this->forgetCaches();
         Flux::toast(variant: 'success', text: 'Change request closed.');
     }
 }; ?>
@@ -208,8 +394,24 @@ new #[Title('Change request')]
 @php
     $cr = $this->cr;
     $project = $this->project;
+    $summary = $this->summary;
     $tab = in_array($tab, ['conversation', 'files', 'revisions'], true) ? $tab : 'conversation';
     [$badgeLabel, $badgeClass] = $cr->badge();
+
+    $stateLabels = ['approved' => 'Approved', 'changes_requested' => 'Changes requested', 'stale' => 'Stale approval', 'pending' => 'Pending'];
+    $stateIcons = ['approved' => 'check', 'changes_requested' => 'exclamation-circle', 'stale' => 'arrow-path', 'pending' => 'clock'];
+    $segmentClasses = [
+        'approved' => 'bg-mint text-ink',
+        'changes_requested' => 'bg-rose text-ink',
+        'pending' => 'bg-butter text-ink',
+        'stale' => 'border border-dashed border-zinc-400 text-zinc-600 dark:text-zinc-300',
+    ];
+    $chipClasses = [
+        'approved' => 'bg-mint text-ink',
+        'changes_requested' => 'bg-rose text-ink',
+        'pending' => 'bg-butter text-ink',
+        'stale' => 'border border-dashed border-white/40 text-white/70',
+    ];
 @endphp
 
 <section class="mx-auto flex w-full max-w-6xl flex-col gap-6">
@@ -235,6 +437,51 @@ new #[Title('Change request')]
             <span class="rounded-full px-3 py-1 {{ $badgeClass }}">{{ $badgeLabel }}</span>
         </div>
     </div>
+
+    {{-- Review bar --}}
+    @if ($cr->isOpen())
+        <div class="flex flex-col gap-2">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+                <div class="flex min-w-0 flex-1 flex-wrap gap-1.5">
+                    @forelse ($summary->reviewers as $r)
+                        <div wire:key="seg-{{ $r['user_id'] }}"
+                            class="flex min-w-[10rem] flex-1 items-center gap-2 whitespace-nowrap rounded-full px-4 py-2 text-sm {{ $segmentClasses[$r['state']] }}">
+                            <flux:icon :name="$stateIcons[$r['state']]" class="size-4 shrink-0" />
+                            <span class="truncate">{{ $stateLabels[$r['state']] }} · {{ $r['name'] }}</span>
+                        </div>
+                    @empty
+                        <div
+                            class="flex flex-1 items-center gap-2 rounded-full border border-dashed border-zinc-400 px-4 py-2 text-sm text-zinc-600 dark:text-zinc-300">
+                            <flux:icon name="user-plus" class="size-4 shrink-0" />
+                            No reviewers yet · {{ $summary->required() }} approval needed
+                        </div>
+                    @endforelse
+                </div>
+
+                @if ($this->canMerge)
+                    <button type="button" wire:click="merge" @disabled(!$summary->ready())
+                        class="rounded-full bg-ink px-6 py-2 text-sm font-medium text-white transition disabled:cursor-not-allowed disabled:opacity-40 dark:bg-brand dark:text-ink">
+                        Merge
+                    </button>
+                @endif
+            </div>
+
+            @if ($this->canMerge && $summary->blockers() !== [])
+                <p class="px-2 text-xs text-zinc-500 dark:text-zinc-400">{{ implode(' · ', $summary->blockers()) }}</p>
+            @endif
+        </div>
+    @elseif ($cr->status === 'merged')
+        <div class="flex items-center gap-2 rounded-full bg-lavender px-5 py-2.5 text-sm text-ink">
+            <flux:icon name="check-circle" class="size-4" />
+            Merged by {{ $cr->merger?->name ?? 'someone' }} {{ $cr->merged_at?->diffForHumans() }}
+        </div>
+    @else
+        <div
+            class="flex items-center gap-2 rounded-full bg-zinc-200 px-5 py-2.5 text-sm text-ink dark:bg-white/15 dark:text-white">
+            <flux:icon name="x-circle" class="size-4" />
+            Closed without merging {{ $cr->closed_at?->diffForHumans() }}
+        </div>
+    @endif
 
     {{-- Folder-style tabs --}}
     <div class="flex items-end gap-1 px-2">
@@ -289,6 +536,17 @@ new #[Title('Change request')]
                                                 · {{ $f->humanSize() }}</span>
                                         @endforeach
                                     </div>
+                                @elseif ($item['type'] === 'review')
+                                    @php $review = $item['review']; @endphp
+                                    <p class="text-sm">
+                                        <span class="font-medium">{{ $item['user']?->name ?? 'Someone' }}</span>
+                                        {{ $review->state === 'approved' ? 'approved' : 'requested changes on' }}
+                                        <span class="font-medium">r{{ $review->revision?->number }}</span>
+                                    </p>
+                                    @if ($review->body)
+                                        <p class="mt-1 whitespace-pre-line rounded-2xl bg-white/70 px-4 py-3 text-sm dark:bg-white/10">
+                                            {{ $review->body }}</p>
+                                    @endif
                                 @elseif ($item['type'] === 'comment')
                                     <div class="flex gap-3">
                                         <flux:avatar :name="$item['user']?->name ?? 'Deleted user'"
@@ -298,6 +556,9 @@ new #[Title('Change request')]
                                             <p class="mt-1 whitespace-pre-line text-sm">{{ $item['comment']->body }}</p>
                                         </div>
                                     </div>
+                                @elseif ($item['type'] === 'merged')
+                                    <p class="text-sm"><span class="font-medium">{{ $item['user']?->name ?? 'Someone' }}</span>
+                                        merged this change request</p>
                                 @elseif ($item['type'] === 'closed')
                                     <p class="text-sm">This change request was closed without merging</p>
                                 @endif
@@ -320,31 +581,129 @@ new #[Title('Change request')]
             </div>
 
             <div class="flex flex-col gap-4 lg:col-span-4">
-                <x-card tone="dark" class="flex flex-col gap-4">
-                    <h2 class="text-lg font-medium">Change request</h2>
+                @if ($cr->isOpen())
+                    <x-card tone="dark" class="flex flex-col gap-4">
+                        <div>
+                            <h2 class="text-lg font-medium">Review</h2>
+                            <p class="text-xs text-white/60">{{ $summary->approvals }} of {{ $summary->required() }} required
+                                approvals</p>
+                        </div>
 
-                    <dl class="grid gap-2 text-sm">
-                        <div class="flex justify-between">
-                            <dt class="text-white/60">Status</dt>
-                            <dd>{{ $badgeLabel }}</dd>
-                        </div>
-                        <div class="flex justify-between">
-                            <dt class="text-white/60">Files changed</dt>
-                            <dd>{{ $this->fileCount }}</dd>
-                        </div>
-                        <div class="flex justify-between">
-                            <dt class="text-white/60">Revisions</dt>
-                            <dd>{{ $this->revisions->count() }}</dd>
-                        </div>
-                    </dl>
+                        @if ($summary->reviewers !== [])
+                            <div class="flex flex-col gap-2">
+                                @foreach ($summary->reviewers as $r)
+                                    <div wire:key="rv-{{ $r['user_id'] }}" class="flex items-center gap-2 text-sm">
+                                        <span
+                                            class="grid size-6 shrink-0 place-items-center rounded-full bg-white/20 text-[11px]">{{ str($r['name'])->substr(0, 2)->upper() }}</span>
+                                        <span class="min-w-0 flex-1 truncate">{{ $r['name'] }}</span>
+                                        <span
+                                            class="rounded-full px-2 py-0.5 text-[11px] {{ $chipClasses[$r['state']] }}">{{ $stateLabels[$r['state']] }}</span>
+                                        @if ($this->canRevise && $r['requested'])
+                                            <button type="button" wire:click="removeReviewer({{ $r['user_id'] }})"
+                                                class="text-white/40 hover:text-white" aria-label="Remove reviewer">
+                                                <flux:icon name="x-mark" class="size-4" />
+                                            </button>
+                                        @endif
+                                    </div>
+                                @endforeach
+                            </div>
+                        @endif
 
-                    @if ($this->canRevise)
-                        <button type="button" wire:click="close" wire:confirm="Close this change request without merging?"
-                            class="rounded-full border border-white/20 px-4 py-2 text-sm transition hover:bg-white/10">
-                            Close without merging
-                        </button>
-                    @endif
-                </x-card>
+                        @if ($this->canRevise && $this->eligibleReviewers->isNotEmpty())
+                            <select wire:change="addReviewer($event.target.value)"
+                                class="rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs text-white">
+                                <option value="" class="text-ink">Request a reviewer…</option>
+                                @foreach ($this->eligibleReviewers as $member)
+                                    <option value="{{ $member->id }}" class="text-ink">{{ $member->name }}</option>
+                                @endforeach
+                            </select>
+                        @endif
+
+                        @if ($this->canReview)
+                            <div class="flex flex-col gap-2">
+                                <textarea wire:model="reviewBody" rows="2"
+                                    placeholder="Leave a note (required when requesting changes)"
+                                    class="w-full rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-sm text-white placeholder-white/40 outline-none focus:ring-2 focus:ring-brand"></textarea>
+                                @error('reviewBody')
+                                <p class="text-xs text-rose">{{ $message }}</p> @enderror
+
+                                <div class="flex gap-2">
+                                    <button type="button" wire:click="submitReview('approved')"
+                                        class="flex-1 rounded-full bg-brand px-4 py-2 text-sm font-medium text-ink">Approve</button>
+                                    <button type="button" wire:click="submitReview('changes_requested')"
+                                        class="flex-1 rounded-full border border-white/25 px-4 py-2 text-sm transition hover:bg-white/10">Request
+                                        changes</button>
+                                </div>
+                            </div>
+                        @endif
+
+                        <div class="flex flex-col gap-1.5 border-t border-white/15 pt-3 text-xs">
+                            @php
+                                $checks = [
+                                    [$summary->approvals >= $summary->required(), '1 approval on the latest revision'],
+                                    [$summary->changesRequestedBy() === [], 'No changes requested'],
+                                    [$summary->outOfDate === [], 'Files are up to date'],
+                                ];
+                            @endphp
+
+                            @foreach ($checks as [$ok, $text])
+                                <div class="flex items-center gap-2 {{ $ok ? '' : 'text-white/60' }}">
+                                    <flux:icon :name="$ok ? 'check' : 'minus-circle'"
+                                        class="size-4 {{ $ok ? 'text-brand' : '' }}" />
+                                    {{ $text }}
+                                </div>
+                            @endforeach
+
+                            <div class="flex items-center gap-2 text-white/60">
+                                <flux:icon name="eye" class="size-4" />
+                                {{ count($this->viewedFileIds) }} of {{ $this->fileCount }} files viewed by you
+                            </div>
+                        </div>
+
+                        @if ($this->canMerge)
+                            <button type="button" wire:click="merge" @disabled(!$summary->ready())
+                                class="rounded-full bg-brand px-4 py-2.5 text-sm font-medium text-ink transition disabled:cursor-not-allowed disabled:opacity-40">
+                                Merge into the project
+                            </button>
+                        @endif
+
+                        @error('merge')
+                        <p class="text-xs text-rose">{{ $message }}</p> @enderror
+
+                        @if ($this->canRevise)
+                            <button type="button" wire:click="close" wire:confirm="Close this change request without merging?"
+                                class="rounded-full border border-white/20 px-4 py-2 text-sm transition hover:bg-white/10">
+                                Close without merging
+                            </button>
+                        @endif
+                    </x-card>
+                @elseif ($cr->status === 'merged')
+                    <x-card tone="dark" class="flex flex-col gap-4">
+                        <div>
+                            <h2 class="text-lg font-medium">Merged</h2>
+                            <p class="text-xs text-white/60">New versions created by this change request</p>
+                        </div>
+
+                        <ul class="flex flex-col gap-2 text-sm">
+                            @foreach ($this->mergedVersions as $version)
+                                <li class="flex items-center justify-between gap-3">
+                                    <span class="truncate">{{ $version->file?->name }}</span>
+                                    <span
+                                        class="shrink-0 rounded-full bg-white/15 px-2 py-0.5 text-xs">v{{ $version->number }}</span>
+                                </li>
+                            @endforeach
+                        </ul>
+
+                        <a href="{{ route('projects.files', $project->slug) }}" wire:navigate
+                            class="rounded-full bg-brand px-4 py-2.5 text-center text-sm font-medium text-ink">View in Files</a>
+                    </x-card>
+                @else
+                    <x-card tone="dark" class="flex flex-col gap-2">
+                        <h2 class="text-lg font-medium">Closed</h2>
+                        <p class="text-sm text-white/60">This change request was closed without merging. Nothing in the project
+                            changed.</p>
+                    </x-card>
+                @endif
 
                 @if ($cr->task)
                     <x-card>
@@ -355,7 +714,7 @@ new #[Title('Change request')]
                         </a>
                         <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                             Now:
-                            {{ $cr->task->status->label() }}{{ $cr->sync_task ? ' · synced with this change request' : ' · not synced' }}
+                            {{ $cr->task->status->label() }}{{ $cr->sync_task ? ' · moves to Done when merged' : ' · not synced' }}
                         </p>
                     </x-card>
                 @endif
@@ -366,13 +725,18 @@ new #[Title('Change request')]
     {{-- ───────── Files changed ───────── --}}
     @if ($tab === 'files')
         <div class="flex flex-col gap-4">
+            <p class="px-2 text-sm text-zinc-500 dark:text-zinc-400">
+                {{ count($this->viewedFileIds) }} of {{ $this->fileCount }} files viewed
+            </p>
+
             @forelse ($this->diffs as $d)
                 @php
                     $rf = $d['rf'];
                     $base = $d['base'];
+                    $isViewed = in_array($rf->project_file_id, $this->viewedFileIds, true);
                 @endphp
 
-                <x-card x-data="{ viewed: false }" wire:key="diff-{{ $rf->id }}">
+                <x-card x-data="{ viewed: {{ $isViewed ? 'true' : 'false' }} }" wire:key="diff-{{ $rf->id }}">
                     <div class="flex flex-wrap items-center justify-between gap-3">
                         <div class="min-w-0">
                             <p class="truncate font-medium">{{ $rf->file?->name ?? $rf->original_name }}</p>
@@ -385,8 +749,9 @@ new #[Title('Change request')]
                                 <span class="text-emerald-600 dark:text-emerald-400">+{{ $d['added'] }}</span>
                                 <span class="text-rose-600 dark:text-rose-400">−{{ $d['removed'] }}</span>
                             @endif
-                            <label class="flex items-center gap-1.5 text-zinc-600 dark:text-zinc-300">
-                                <input type="checkbox" x-model="viewed"> Viewed
+                            <label class="flex cursor-pointer items-center gap-1.5 text-zinc-600 dark:text-zinc-300">
+                                <input type="checkbox" x-model="viewed"
+                                    x-on:change="$wire.toggleViewed({{ $rf->project_file_id }})"> Viewed
                             </label>
                         </div>
                     </div>
@@ -452,7 +817,8 @@ new #[Title('Change request')]
                                         class="mt-2 inline-block text-xs underline">Download</a>
                                 </div>
                             </div>
-                            <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">No inline diff available for this file (binary or too large).</p>
+                            <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400">No inline diff available for this file (binary
+                                or too large).</p>
                         @endif
                     </div>
                 </x-card>
@@ -471,7 +837,7 @@ new #[Title('Change request')]
                     <div>
                         <h2 class="text-lg font-medium">Push a new revision</h2>
                         <p class="text-sm text-zinc-500 dark:text-zinc-400">Upload updated files. Earlier revisions are kept,
-                            and the newest version of each file is what gets reviewed.</p>
+                            and the newest version of each file is what gets reviewed. Earlier approvals become stale.</p>
                     </div>
 
                     <x-dropzone wire:model="uploads" hint="Up to 10 MB each" />
