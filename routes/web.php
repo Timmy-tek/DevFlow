@@ -28,6 +28,8 @@ Route::middleware(['auth', 'verified'])->group(function () {
         Route::livewire('projects/{slug}/changes', 'pages::changes.index')->name('changes.index');
         Route::livewire('projects/{slug}/changes/create', 'pages::changes.create')->name('changes.create');
         Route::livewire('projects/{slug}/changes/{number}', 'pages::changes.show')->whereNumber('number')->name('changes.show');
+        Route::livewire('projects/{slug}/releases', 'pages::releases.index')->name('releases.index');
+        Route::livewire('projects/{slug}/releases/{id}', 'pages::releases.show')->whereNumber('id')->name('releases.show');
         Route::livewire('members', 'pages::members.index')->name('members.index');
     });
 });

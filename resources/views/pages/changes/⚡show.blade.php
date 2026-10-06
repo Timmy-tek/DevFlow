@@ -59,7 +59,7 @@ new #[Title('Change request')]
     {
         return $this->project->changeRequests()
             ->where('number', $this->number)
-            ->with(['author', 'merger', 'task', 'reviews', 'latestRevision'])
+            ->with(['author', 'merger', 'task', 'reviews', 'latestRevision', 'release'])
             ->firstOrFail();
     }
 
@@ -592,6 +592,12 @@ new #[Title('Change request')]
                 <a href="{{ route('projects.board', $project->slug) }}" wire:navigate
                     class="rounded-full bg-sky px-3 py-1 text-ink">
                     {{ $project->key }}-{{ $cr->task->number }} {{ $cr->task->title }}
+                </a>
+            @endif
+            @if ($cr->release)
+                <a href="{{ route('releases.show', [$project->slug, $cr->release->id]) }}" wire:navigate
+                    class="rounded-full bg-lavender px-3 py-1 text-ink">
+                    {{ $cr->release->isPublished() ? 'Shipped in' : 'Queued for' }} {{ $cr->release->version }}
                 </a>
             @endif
             <span class="rounded-full px-3 py-1 {{ $badgeClass }}">{{ $badgeLabel }}</span>

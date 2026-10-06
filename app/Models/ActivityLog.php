@@ -46,6 +46,8 @@ class ActivityLog extends Model
             'cr.merged' => "merged {$ref}{$title}",
 
             'cr.reopened' => "reopened {$ref}{$title}",
+
+            'release.published' => "published release {$p['version']}",
             default => $this->action,
         };
     }

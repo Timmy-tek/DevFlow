@@ -84,4 +84,9 @@ class Project extends Model
     {
         return $this->hasMany(ChangeRequest::class);
     }
+
+    public function releases(): HasMany
+    {
+        return $this->hasMany(Release::class);
+    }
 }

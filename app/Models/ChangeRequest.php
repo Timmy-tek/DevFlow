@@ -209,4 +209,9 @@ class ChangeRequest extends Model
 
         return $rows;
     }
+
+    public function release(): BelongsTo
+    {
+        return $this->belongsTo(Release::class);
+    }
 }
