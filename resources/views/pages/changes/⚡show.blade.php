@@ -20,6 +20,8 @@ use Livewire\Component;
 
 use App\Models\ActivityLog;
 
+use App\Support\ImageFingerprint;
+
 new #[Title('Change request')]
     class extends Component {
     use StagesChangeFiles;
@@ -188,10 +190,29 @@ new #[Title('Change request')]
 
         foreach ($this->cr->latestFiles() as $rf) {
             $base = $rf->baseVersion;
-            $entry = ['rf' => $rf, 'base' => $base, 'kind' => 'binary', 'rows' => [], 'added' => 0, 'removed' => 0];
+            $entry = [
+                'rf' => $rf,
+                'base' => $base,
+                'kind' => 'binary',
+                'rows' => [],
+                'added' => 0,
+                'removed' => 0,
+                'oldDims' => null,
+                'newDims' => null,
+                'changed' => null,
+            ];
 
             if ($rf->isImage() && $base->isImage()) {
                 $entry['kind'] = 'image';
+
+                $old = $disk->get($base->path);
+                $new = $disk->get($rf->path);
+
+                if (is_string($old) && is_string($new)) {
+                    $entry['oldDims'] = ImageFingerprint::dimensions($old);
+                    $entry['newDims'] = ImageFingerprint::dimensions($new);
+                    $entry['changed'] = ImageFingerprint::changedArea($old, $new);
+                }
             } elseif (
                 TextDiff::looksLikeText($rf->original_name, $rf->mime)
                 && $rf->size <= 512 * 1024
@@ -311,6 +332,12 @@ new #[Title('Change request')]
 
         if ($problems) {
             $this->addError('staged', implode(' ', $problems));
+
+            return;
+        }
+
+        if ($service->opaqueNames($this->staged) && trim($this->revisionNote) === '') {
+            $this->addError('revisionNote', 'Describe what changed in this revision. The files can\'t be compared line by line.');
 
             return;
         }

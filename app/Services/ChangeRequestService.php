@@ -16,6 +16,9 @@ use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 use Throwable;
 
+use App\Models\FileVersion;
+use App\Support\TextDiff;
+
 class ChangeRequestService
 {
     public const MAX_BYTES = 10 * 1024 * 1024;
@@ -258,5 +261,23 @@ class ChangeRequestService
 
             throw $e;
         }
+    }
+
+    /** Names of staged files that can't be shown as a text diff or an image comparison. */
+    public function opaqueNames(array $staged): array
+    {
+        $names = [];
+
+        foreach ($staged as $item) {
+            $upload = $item['upload'];
+            $name = $upload->getClientOriginalName();
+            $mime = $upload->getMimeType();
+
+            if (!TextDiff::looksLikeText($name, $mime) && !in_array($mime, FileVersion::PREVIEWABLE, true)) {
+                $names[] = $name;
+            }
+        }
+
+        return $names;
     }
 }

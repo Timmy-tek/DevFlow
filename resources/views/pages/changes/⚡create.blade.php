@@ -82,6 +82,14 @@ new #[Title('New change request')]
             return;
         }
 
+        $opaque = $service->opaqueNames($this->staged);
+
+        if ($opaque && trim($validated['description'] ?? '') === '') {
+            $this->addError('description', 'Describe what changed: ' . implode(', ', $opaque) . ' can\'t be compared line by line, so reviewers rely on your description.');
+
+            return;
+        }
+
         $cr = DB::transaction(function () use ($project, $validated, $service) {
             $cr = $project->changeRequests()->create([
                 'title' => trim($validated['title']),
